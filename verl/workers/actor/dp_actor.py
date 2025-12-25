@@ -141,7 +141,6 @@ class DataParallelPPOActor(BasePPOActor):
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
-                    extra_args["return_dict"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -333,7 +332,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", 'token_level_scores']
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -385,12 +384,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
+                    token_level_scores = data['token_level_scores']
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
+                    positive_learning_weight = self.config.positive_learning_weight
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
@@ -404,6 +405,8 @@ class DataParallelPPOActor(BasePPOActor):
                         log_prob=log_prob,
                         advantages=advantages,
                         response_mask=response_mask,
+                        token_level_scores=token_level_scores,
+                        positive_learning_weight=positive_learning_weight,
                         cliprange=clip_ratio,
                         cliprange_low=clip_ratio_low,
                         cliprange_high=clip_ratio_high,
@@ -446,6 +449,6 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, data)
+            append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         return metrics

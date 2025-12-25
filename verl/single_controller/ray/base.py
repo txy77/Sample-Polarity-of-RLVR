@@ -44,7 +44,7 @@ def get_random_string(length: int) -> str:
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
-            args, kwargs = dispatch_fn(self, *args, **kwargs)
+            args, kwargs = dispatch_fn(self, *args, **kwargs) # TODO: 这边切片出了问题
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:

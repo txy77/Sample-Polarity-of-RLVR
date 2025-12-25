@@ -19,8 +19,12 @@ try:
 except ImportError:
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
 
+import re
+from math_verify import parse, verify
 
-def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
+
+'''
+def compute_score(model_output: str, ground_truth: str) -> bool:
     verify_func = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),
         pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
@@ -37,3 +41,19 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
         ret_score = timeout_score
 
     return ret_score
+'''
+
+
+def compute_score(model_output: str, ground_truth: str) -> bool:
+    parsed_ground_truth = parse(ground_truth)
+    parsed_output = parse(model_output)
+    correct = verify(parsed_ground_truth, parsed_output)
+
+    reward = 1.0 if correct else 0.0
+    acc = correct
+
+    return {
+        "score": reward,
+        "acc": acc,
+        # "pred": parsed_output,
+    }

@@ -148,6 +148,7 @@ class ActorRolloutRefWorker(MegatronWorker):
         from verl.utils.megatron_utils import get_model, init_megatron_optim_config
         from verl.utils.model import get_generation_config, print_model_size
 
+        self.config.model['trust_remote_code'] = True
         self._init_hf_config_and_tf_config(model_path, model_path, self.dtype, override_model_config, override_transformer_config, self.config.model.get("trust_remote_code", False))
         self.generation_config = get_generation_config(self.local_path)
 
@@ -406,7 +407,7 @@ class ActorRolloutRefWorker(MegatronWorker):
                 optimizer_scheduler=self.actor_optimizer_scheduler,
                 use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.config.actor.optim.use_checkpoint_opt_param_scheduler,
-                checkpoint_contents=self.config.actor.checkpoint,
+                checkpoint_contents=self.config.actor.checkpoint.contents,
             )
         torch.cuda.empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
@@ -750,7 +751,7 @@ class CriticWorker(MegatronWorker):
             optimizer_scheduler=self.critic_optimizer_scheduler,
             use_distributed_optimizer=self.config.megatron.use_distributed_optimizer,
             use_checkpoint_opt_param_scheduler=self.config.optim.use_checkpoint_opt_param_scheduler,
-            checkpoint_contents=self.config.checkpoint,
+            checkpoint_contents=self.config.checkpoint.contents,
         )
 
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)

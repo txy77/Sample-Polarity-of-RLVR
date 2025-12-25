@@ -78,6 +78,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
+    PSR_NSR = 'psr_nsr'
 
 
 class AdaptiveKLController:
@@ -161,6 +162,54 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.PSR_NSR) # or simply: @register_adv_est("PSR_NSR")
+def compute_psr_nsr_outcome_advantage(token_level_rewards: torch.Tensor, token_level_scores: torch.Tensor, eos_mask: torch.Tensor,
+                                  gamma: torch.Tensor, advantage: str, positive_advantage_weight: float):
+    """
+    Compute advantage for PSR, NSR, and W-REINFORCE.
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        token_level_scores: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+
+    with torch.no_grad():
+        returns = torch.zeros_like(token_level_rewards)
+        running_return = 0
+        correct_idx = token_level_scores.sum(-1) == 1 
+        incorrect_idx = token_level_scores.sum(-1) == 0
+
+        for t in reversed(range(token_level_rewards.shape[1])):
+            running_return = token_level_rewards[:, t] + gamma * running_return
+            returns[:, t] = running_return
+            # Reset after EOS
+            running_return = running_return * eos_mask[:, t]
+
+        if advantage == 'positive':
+            advantages = returns.clone()
+        elif advantage == 'negative':
+            advantages = returns.clone() - 1
+        elif advantage == 'weighted':
+            advantages = returns.clone()
+            advantages[correct_idx] *= positive_advantage_weight
+            advantages[incorrect_idx] -= 1
+        else:
+            raise NotImplementedError
+        advantages = advantages * eos_mask
+
+    return advantages, returns
+
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
@@ -526,11 +575,13 @@ def compute_policy_loss(
     log_prob,
     advantages,
     response_mask,
+    token_level_scores=None,
     cliprange=None,
     cliprange_low=None,
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    positive_learning_weight=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -560,20 +611,39 @@ def compute_policy_loss(
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
     """
+
     assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
 
+    correct_idx = token_level_scores.sum(-1) == 1 
+    incorrect_idx = token_level_scores.sum(-1) == 0
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    pg_losses1 = -advantages * ratio
+    pg_losses = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
     pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    if positive_learning_weight is not None: # TODO: 这边可能有点问题
+        assert positive_learning_weight > 0 and positive_learning_weight < 1, f"positive_learning_weight must be in (0, 1). Got {positive_learning_weight}"
+        pos_pg_losses = pg_losses[correct_idx]
+        pos_pg_losses2 = pg_losses2[correct_idx]
+        # pos_pg_loss = response_mask[correct_idx].sum() / response_mask.sum() * verl_F.masked_mean(torch.max(pos_pg_losses, pos_pg_losses2), response_mask[correct_idx])
+        pos_pg_loss = torch.maximum(pos_pg_losses, pos_pg_losses2)
+
+        neg_pg_losses = pg_losses[incorrect_idx]
+        neg_pg_losses2 = pg_losses2[incorrect_idx]
+        # neg_pg_loss = response_mask[incorrect_idx].sum() / response_mask.sum() * verl_F.masked_mean(torch.max(neg_pg_losses, neg_pg_losses2), response_mask[incorrect_idx])
+        neg_pg_loss = torch.maximum(neg_pg_losses, neg_pg_losses2)
+
+        clip_pg_losses1 = positive_learning_weight * pos_pg_loss + neg_pg_loss
+    else:
+        clip_pg_losses1 = torch.maximum(pg_losses, pg_losses2)
+        # pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), response_mask)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)

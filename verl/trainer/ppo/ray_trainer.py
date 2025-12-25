@@ -18,6 +18,8 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import copy
+from copy import deepcopy
 import json
 import os
 import uuid
@@ -42,6 +44,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
+import verl.utils.torch_functional as verl_F
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -60,6 +63,62 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = Type[Worker]
+
+# TODO: add this
+
+
+def make_num_of_resample_divisible(success_indices, failed_indices, world_size):
+    # move failed indices to success indices to make it divisible, then do resampling for remaining failed indices
+    len_a = success_indices.size(0)
+    remainder = len_a % world_size
+
+    if remainder == 0:
+        return success_indices, failed_indices  # Already a multiple of 8, no need to modify
+
+    # Determine the number of indices to move from b to a
+    num_to_move = world_size - remainder
+
+    # Ensure there are enough elements in b to move
+    if failed_indices.size(0) < num_to_move:
+        raise ValueError(f"Not enough elements in a ({success_indices.size(0)}) to make a a multiple of {world_size}.")
+
+    # Randomly select indices from b
+    perm = torch.randperm(failed_indices.size(0))  # Shuffle indices
+    move_indices = perm[:num_to_move]
+
+    # Move selected indices from b to a
+
+    success_indices = torch.cat((success_indices, failed_indices[move_indices]), dim=0)
+    failed_indices = failed_indices[torch.cat((perm[num_to_move:],), dim=0)]  # Keep remaining elements in b
+
+    return success_indices, failed_indices
+
+# TODO: add this
+
+def drop_extra_rows(data, world_size):
+    """
+    Ensures the batch size of a TensorDict is divisible by world_size.
+    If not, randomly drops the minimal number of extra rows.
+
+    Args:
+        td (TensorDict): The input TensorDict after filtering.
+        remainder (int): The number of extra rows to drop if the batch size is not divisible.
+    Returns:
+        mask (torch.BoolTensor): A mask indicating which rows to keep.
+    """
+
+    # Compute the number of extra rows to drop
+    batch_size = data.batch.batch_size[0]
+    num_to_drop = batch_size % world_size  # Drop the least amount to make it divisible
+
+    # Randomly select `num_to_drop` indices to remove
+    drop_indices = torch.randperm(batch_size)[:num_to_drop]  # Shuffle and pick indices
+
+    # Create a mask to keep only non-dropped indices
+    mask = torch.ones(batch_size, dtype=torch.bool)
+    mask[drop_indices] = False  # Mark indices for dropping
+
+    return mask
 
 
 class Role(Enum):
@@ -160,9 +219,13 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty)  # (batch_size, response_length)
-    kld = kld * response_mask
-    beta = kl_ctrl.value
+    if 'ref_log_prob' in data.batch.keys():
+        kld = core_algos.kl_penalty(data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty)  # (batch_size, response_length)
+        kld = kld * response_mask
+        beta = kl_ctrl.value
+    else:
+        beta = 0
+        kld = torch.zeros_like(response_mask, dtype=torch.float32)
 
     token_level_rewards = token_level_scores - beta * kld
 
@@ -196,7 +259,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, advantage='positive', positive_advantage_weight=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -236,6 +299,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 config.get("pf_ppo_reweight_method", "pow"),
                 config.get("pf_ppo_weight_pow", 2.0),
             )
+
+    elif adv_estimator == AdvantageEstimator.PSR_NSR:
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        token_level_rewards = data.batch['token_level_rewards']
+        token_level_scores = data.batch['token_level_scores']
+        advantages, returns = core_algos.compute_psr_nsr_outcome_advantage(token_level_rewards=token_level_rewards,
+            token_level_scores=token_level_scores,
+            eos_mask=response_mask,
+            gamma=gamma,
+            advantage=advantage,
+            positive_advantage_weight=positive_advantage_weight,
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
@@ -326,6 +407,8 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
+        else:
+            self.kl_ctrl_in_reward = core_algos.FixedKLController(kl_coef=0.)
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -337,6 +420,7 @@ class RayPPOTrainer:
             AdvantageEstimator.RLOO,
             AdvantageEstimator.OPO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+            AdvantageEstimator.PSR_NSR,
         ]:
             self.use_critic = False
         else:
@@ -384,6 +468,10 @@ class RayPPOTrainer:
 
         if not config.actor_rollout_ref.actor.use_dynamic_bsz:
             # actor: ppo_micro_batch_size vs. ppo_micro_batch_size_per_gpu
+
+            print("ppo_micro_batch_size", config.actor_rollout_ref.actor.ppo_micro_batch_size)
+            print("ppo_micro_batch_size_per_gpu", config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu)
+
             check_mutually_exclusive(
                 config.actor_rollout_ref.actor.ppo_micro_batch_size,
                 config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
@@ -581,6 +669,8 @@ class RayPPOTrainer:
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        # prob_lst = []
+        # entropy_lst = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -638,6 +728,27 @@ class RayPPOTrainer:
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
 
+            # x = copy.deepcopy(test_output_gen_batch)
+            # x = DataProto(batch=x.batch, non_tensor_batch=x.non_tensor_batch, meta_info=x.meta_info)
+            # x.meta_info['return_entropy'] = True
+            # mask = drop_extra_rows(x, world_size=self.actor_rollout_wg.world_size)
+            # x.subset(mask)
+            # print(f"Subset from {test_output_gen_batch.batch.batch_size[0]} to {x.batch.batch_size[0]} for calculation of entropy")
+            # assert isinstance(x, DataProto), type(x)
+            # output = self.actor_rollout_wg.compute_log_prob(data=x)
+            # test_output_gen_batch.subset(mask)
+            # test_batch.subset(mask)
+            # log_prob = output.batch['old_log_probs']  # (bsz, response_length)
+            # entropy = output.batch['entropy']
+            # responses = test_output_gen_batch.batch['responses']
+            # response_length = responses.size(1)
+            # attention_mask = test_output_gen_batch.batch['attention_mask']
+            # response_mask = attention_mask[:, -response_length:]
+            # entropy = verl_F.masked_mean(entropy, response_mask, axis=1)
+            # prob = torch.exp(log_prob.sum(dim=-1)).cpu().tolist()  # (bsz, )
+            # prob_lst.append(prob)
+            # entropy_lst.append(entropy)
+
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -645,9 +756,16 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
 
+            print("Computing val rewards starts")
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
+            print("Computing val rewards ends")
+
+            # evaluate using reward_function
+            
             reward_tensor = result["reward_tensor"]
+            
+
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
@@ -907,12 +1025,18 @@ class RayPPOTrainer:
             if self.config.trainer.get("val_only", False):
                 return
 
+        fully_solved_question_cnt = 0
+        fully_unsolved_question_cnt = 0
+        at_least_solve_one_time_question_cnt = 0
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+
+        advantage = self.config.algorithm.advantage
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1043,51 +1167,128 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    with _timer("adv", timing_raw):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                    # TODO: add this
+                    with _timer('adv', timing_raw):
+                        # compute scores. Support both model and function-based.
+                        # We first compute the scores using reward model. Then, we call reward_fn to combine
+                        # the results from reward model and rule-based results.
+                        if self.use_rm:
+                            # we first compute reward model score
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        # we combine with rule-based rm
+                        with _timer('reward_fn', timing_raw):
+                            reward_tensor = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                            batch, kl_metrics = apply_kl_penalty(batch,
+                                                                 kl_ctrl=self.kl_ctrl_in_reward,
+                                                                 kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
+                        # TODO: count correct ratio for each sample
+                        # TODO: calculate themean entropy, response length for each group of samples
+
+                        correct_idx = batch.batch['token_level_scores'].sum(-1) == 1 
+                        incorrect_idx = batch.batch['token_level_scores'].sum(-1) == 0
+                        correct_count = correct_idx.sum()
+                        incorrect_count = incorrect_idx.sum()
+                        assert correct_count + incorrect_count == batch.batch.batch_size[0], f"correct_count: {correct_count}; incorrect_count: {incorrect_count}, batch_size: {batch.batch.batch_size[0]}"
+                        print(f"correct_count: {correct_count}; incorrect_count: {incorrect_count}, batch_size: {batch.batch.batch_size[0]}")
+
+                        # Step 1: Compute correctness per UID
+                        id2correct = defaultdict(lambda: [0, 0])  # [correct_count, total_count]
+
+                        bsz = batch.batch.batch_size[0]
+                        for i in range(bsz):
+                            uid = batch.non_tensor_batch['uid'][i]
+                            id2correct[uid][1] += 1  # Total count
+                            if correct_idx[i]:  # keep_mask[i] = True means correct, so False means incorrect
+                                id2correct[uid][0] += 1  # Correct count
+
+                        # Step 2: Compute correctness percentage
+                        id2correctness = {uid: correct / total for uid, (correct, total) in id2correct.items()}
+                        fully_solved_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness == 1.0])
+                        fully_unsolved_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness == 0.0])
+                        at_least_solve_one_time_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness > 0.0])
+
+                        # Step 3: Filter out UIDs exceeding the threshold
+                        fully_solved_uids = {uid for uid, correctness in id2correctness.items() if correctness >= 1}
+                        fully_unsolved_uids = {uid for uid, correctness in id2correctness.items() if correctness <= 0}
+                        one_time_solved_uids = {uid for uid, correctness in id2correctness.items() if 0 < correctness <= 1}
+                        tqdm.write(f"{len(fully_solved_uids)} out of {len(id2correctness)} UIDs in current batch are fully correct!")
+                        tqdm.write(f"{len(fully_unsolved_uids)} out of {len(id2correctness)} UIDs in current batch are fully incorrect!")
+                        tqdm.write(f"{len(one_time_solved_uids)} out of {len(id2correctness)} UIDs in current batch are at least solved one time!")
+
+                        raw_batch = deepcopy(batch)
+
+                        raw_batch = compute_advantage(raw_batch,
+                            adv_estimator=AdvantageEstimator.GRPO,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        )
+
+                        full_batch = deepcopy(raw_batch)
+
+
+                        # TODO remove for other advantage estimation methods
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR and advantage != 'weighted':
+                            if advantage == 'positive':
+                                batch.subset(correct_idx)
+                                raw_batch.subset(correct_idx)
+                            elif advantage == 'negative':
+                                batch.subset(incorrect_idx)
+                                raw_batch.subset(incorrect_idx)
+                            else:
+                                raise NotImplementedError
+                            print("World Size:", self.actor_rollout_wg.world_size)
+                            divisible_mask = drop_extra_rows(batch, self.actor_rollout_wg.world_size)
+                            
+                            batch.subset(divisible_mask)
+                            raw_batch.subset(divisible_mask)
+                            tqdm.write(f"Subset to {batch.batch.batch_size[0]} {'correct' if advantage == 'positive' else 'incorrect'} samples.")
+
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR and advantage != 'weighted' and batch.batch.batch_size[0] == 0:
+                            print("Less than a chunk, jump this step, not update policy!")
+                            continue
+
+                        metrics["effective_examples"] = batch.batch.batch_size[0]
+                        metrics["correct_count"] = correct_count
+                        metrics["incorrect_count"] = incorrect_count
                         # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
+                        batch = compute_advantage(batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            config=self.config.algorithm,
+                            advantage=advantage,
+                            positive_advantage_weight=self.config.algorithm.positive_advantage_weight,
                         )
+
+                    # TODO: use raw batch advantage
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR:
+                        batch.batch['advantages'] = raw_batch.batch['advantages']
 
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                        metrics.update(critic_output_metrics)                    
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
+
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self.actor_rollout_wg.update_actor(batch) # TODO：更新的时候出问题了
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1127,7 +1328,9 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR and advantage != 'weighted':
+                metrics.update(compute_data_metrics(batch=full_batch, use_critic=self.use_critic, subfix="full")) # TODO: use full batch
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic)) # TODO: 用原始的batch
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

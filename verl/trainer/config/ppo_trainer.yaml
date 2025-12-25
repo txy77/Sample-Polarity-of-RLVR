@@ -98,7 +98,7 @@ actor_rollout_ref:
   model:
   
     # Huggingface model path. This can be either local path or HDFS path.
-    path: ~/models/deepseek-llm-7b-chat
+    path: Distill-qwen-1_5B
 
     # Whether to use shared memory (SHM) for accelerating the loading of model weights
     use_shm: false
@@ -133,17 +133,11 @@ actor_rollout_ref:
     
     # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
     use_fused_kernels: false
-
-    # Options for fused kernels. If use_fused_kernels is true, this will be used.
-    fused_kernel_options:
-
-      # Implementation backend for fused kernels. Options: "triton" or "torch".
-      impl_backend: torch
     
     # Whether to enable loading a remote code model
     trust_remote_code: false
 
-  # actor configs
+  # configs for the actor
   actor:
   
     # fsdp, fsdp2 or megatron. fsdp backend used here.
@@ -156,7 +150,7 @@ actor_rollout_ref:
     ppo_micro_batch_size: null
     
     # Local per-GPU micro batch size
-    ppo_micro_batch_size_per_gpu: null
+    ppo_micro_batch_size_per_gpu: 1
     
     # Whether to automatically adjust batch size at runtime
     use_dynamic_bsz: false
@@ -185,6 +179,8 @@ actor_rollout_ref:
     
     # Entropy regularization coefficient in PPO loss
     entropy_coeff: 0
+
+    positive_learning_weight: null
     
     # Whether to use KL loss instead of KL reward penalty. True for GRPO
     use_kl_loss: false
@@ -218,10 +214,7 @@ actor_rollout_ref:
     
       # What to include in saved checkpoints
       # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
-      save_contents: ['model', 'optimizer', 'extra']
-
-      # For more flexibility, you can specify the contents to load from the checkpoint.
-      load_contents: ${actor_rollout_ref.actor.checkpoint.save_contents}
+      contents: ['model', 'optimizer', 'extra']
 
     # optimizer configs
     optim:
@@ -622,10 +615,7 @@ critic:
 
     # What to include in saved checkpoints
     # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
-    save_contents: ['model', 'optimizer', 'extra']
-
-    # What to include when loading checkpoints
-    load_contents: ${critic.checkpoint.save_contents}
+    contents: ['model', 'optimizer', 'extra']
 
 # configs for the reward model
 reward_model:
@@ -743,7 +733,11 @@ algorithm:
   lam: 1.0
 
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
-  adv_estimator: gae
+  adv_estimator: psr_nsr
+
+  advantage: positive
+
+  positive_advantage_weight: 1
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True

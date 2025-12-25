@@ -96,7 +96,6 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
 
 
 def unpad_dataproto(data: "DataProto", pad_size):
-    """Unpad the data proto with pad_size. i.e. `data[:-pad_size]`"""
     if pad_size != 0:
         data = data[:-pad_size]
     return data
@@ -196,6 +195,13 @@ class DataProtoItem:
     batch: TensorDict = None
     non_tensor_batch: Dict = field(default_factory=dict)
     meta_info: Dict = field(default_factory=dict)
+
+    def subset(self, indices):
+        """
+        Note that this operation is in-place
+        """
+        self.batch = self.batch[indices]
+        self.non_tensor_batch = {key: val[indices] for key, val in self.non_tensor_batch.items()}
 
 
 @dataclass
@@ -709,6 +715,16 @@ class DataProto:
 
         cls = type(data[0]) if len(data) > 0 else DataProto
         return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+
+
+    # TODO: add this
+
+    def subset(self, indices):
+        """
+        Note that this operation is in-place
+        """
+        self.batch = self.batch[indices]
+        self.non_tensor_batch = {key: val[indices] for key, val in self.non_tensor_batch.items()}
 
     def reorder(self, indices):
         """
