@@ -259,7 +259,29 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, advantage='positive', positive_advantage_weight=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
+def compute_advantage(
+    data: DataProto, 
+    adv_estimator, 
+    gamma=1.0, 
+    lam=1.0, 
+    num_repeat=1, 
+    advantage='positive', 
+    entropys=None, 
+    positive_advantage_weight=1, 
+    negative_advantage_weight=1, 
+    token_weighted_metric=None, # probs / entropy
+    token_weighted_positive_high_num_ratio=None, # positive high num ratio
+    token_weighted_positive_high_scale=None, # positive high scale
+    token_weighted_positive_low_num_ratio=None, # positive low num ratio
+    token_weighted_positive_low_scale=None, # positive low scale
+    token_weighted_negative_high_num_ratio=None, # negative high num ratio
+    token_weighted_negative_high_scale=None, # negative high scale
+    token_weighted_negative_low_num_ratio=None, # negative low num ratio
+    token_weighted_negative_low_scale=None, # negative low scale
+    multi_turn=False, 
+    norm_adv_by_std_in_grpo=True, 
+    config=None
+):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -313,6 +335,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             gamma=gamma,
             advantage=advantage,
             positive_advantage_weight=positive_advantage_weight,
+            negative_advantage_weight=negative_advantage_weight,
+
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -328,10 +352,25 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            data=data,
             token_level_rewards=data.batch["token_level_rewards"],
+            token_level_scores=data.batch["token_level_scores"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            advantage=advantage,
+            entropys=entropys,
+            positive_advantage_weight=positive_advantage_weight,
+            negative_advantage_weight=negative_advantage_weight,
+            token_weighted_metric=token_weighted_metric, # probs / entropy
+            token_weighted_positive_high_num_ratio=token_weighted_positive_high_num_ratio, # positive high num ratio
+            token_weighted_positive_high_scale=token_weighted_positive_high_scale, # positive high scale
+            token_weighted_positive_low_num_ratio=token_weighted_positive_low_num_ratio, # positive low num ratio
+            token_weighted_positive_low_scale=token_weighted_positive_low_scale, # positive low scale
+            token_weighted_negative_high_num_ratio=token_weighted_negative_high_num_ratio, # negative high num ratio
+            token_weighted_negative_high_scale=token_weighted_negative_high_scale, # negative high scale
+            token_weighted_negative_low_num_ratio=token_weighted_negative_low_num_ratio, # negative low num ratio
+            token_weighted_negative_low_scale=token_weighted_negative_low_scale, # negative low scale
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -642,6 +681,67 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    
+    def _dump_idx2metrics(self, dump_dir: str):
+        """
+        Dump self.idx2metrics to a JSON file.
+        Converts defaultdict to dict for JSON serialization.
+        """
+        def default_to_dict(obj):
+            """Recursively convert defaultdict to dict."""
+            if isinstance(obj, defaultdict):
+                return {k: default_to_dict(v) for k, v in obj.items()}
+            elif isinstance(obj, dict):
+                return {k: default_to_dict(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [default_to_dict(item) for item in obj]
+            else:
+                return obj
+
+        # Convert self.idx2metrics to pure dict
+        metrics_data = default_to_dict(self.idx2metrics)
+
+        # Create save path
+        os.makedirs(os.path.join(dump_dir, "metrics"), exist_ok=True)
+        filename = os.path.join(dump_dir, "metrics", f"{self.global_steps}_idx2metrics.json")
+
+        # Save as JSON
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(metrics_data, f, indent=2, ensure_ascii=False)
+
+        print(f"Dumped idx2metrics to {filename}")
+
+    
+    def _dump_val_idx2metrics(self, dump_dir: str):
+        """
+        Dump self.idx2metrics to a JSON file.
+        Converts defaultdict to dict for JSON serialization.
+        """
+        def default_to_dict(obj):
+            """Recursively convert defaultdict to dict."""
+            if isinstance(obj, defaultdict):
+                return {k: default_to_dict(v) for k, v in obj.items()}
+            elif isinstance(obj, dict):
+                return {k: default_to_dict(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [default_to_dict(item) for item in obj]
+            else:
+                return obj
+
+        # Convert self.val_idx2metrics to pure dict
+        metrics_data = default_to_dict(self.val_idx2metrics)
+
+        # Create save path
+        os.makedirs(os.path.join(dump_dir, "val_metrics"), exist_ok=True)
+        filename = os.path.join(dump_dir, "val_metrics", f"{self.global_steps}_val_idx2metrics.json")
+
+        # Save as JSON
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(metrics_data, f, indent=2, ensure_ascii=False)
+
+        print(f"Dumped val_idx2metrics to {filename}")
+
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -676,6 +776,16 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+
+        sample_id2accuracy = defaultdict(list)
+        sample_id2pos_entropy = defaultdict(list)
+        sample_id2neg_entropy = defaultdict(list)
+        sample_id2entropy = defaultdict(list)
+        sample_id2pos_response_length = defaultdict(list)
+        sample_id2neg_response_length = defaultdict(list)
+        sample_id2response_length = defaultdict(list)
+
+        # TODO：需要整体的进行计算，计算整个测试集
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -728,23 +838,29 @@ class RayPPOTrainer:
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
 
-            # x = copy.deepcopy(test_output_gen_batch)
-            # x = DataProto(batch=x.batch, non_tensor_batch=x.non_tensor_batch, meta_info=x.meta_info)
-            # x.meta_info['return_entropy'] = True
-            # mask = drop_extra_rows(x, world_size=self.actor_rollout_wg.world_size)
-            # x.subset(mask)
-            # print(f"Subset from {test_output_gen_batch.batch.batch_size[0]} to {x.batch.batch_size[0]} for calculation of entropy")
-            # assert isinstance(x, DataProto), type(x)
-            # output = self.actor_rollout_wg.compute_log_prob(data=x)
-            # test_output_gen_batch.subset(mask)
-            # test_batch.subset(mask)
-            # log_prob = output.batch['old_log_probs']  # (bsz, response_length)
-            # entropy = output.batch['entropy']
-            # responses = test_output_gen_batch.batch['responses']
-            # response_length = responses.size(1)
-            # attention_mask = test_output_gen_batch.batch['attention_mask']
-            # response_mask = attention_mask[:, -response_length:]
-            # entropy = verl_F.masked_mean(entropy, response_mask, axis=1)
+            idxs = test_batch.non_tensor_batch["index"]
+            x = copy.deepcopy(test_output_gen_batch)
+            x = DataProto(batch=x.batch, non_tensor_batch=x.non_tensor_batch, meta_info=x.meta_info)
+            x.meta_info['return_entropy'] = True
+            mask = drop_extra_rows(x, world_size=self.actor_rollout_wg.world_size)
+            x.subset(mask)
+            print(f"Subset from {test_output_gen_batch.batch.batch_size[0]} to {x.batch.batch_size[0]} for calculation of entropy")
+            assert isinstance(x, DataProto), type(x)
+            output = self.actor_rollout_wg.compute_log_prob(data=x)
+            test_output_gen_batch.subset(mask)
+            test_batch.subset(mask)
+            log_prob = output.batch['old_log_probs']  # (bsz, response_length)
+
+            entropy = output.batch['entropys']
+            responses = test_output_gen_batch.batch['responses']
+            response_length = responses.size(1)
+            attention_mask = test_output_gen_batch.batch['attention_mask']
+            response_mask = attention_mask[:, -response_length:]
+            response_length = response_mask.sum(dim=-1).float()
+            entropy = verl_F.masked_mean(entropy, response_mask, axis=1)
+
+            # TODO: 这里加上一些监测指标
+
             # prob = torch.exp(log_prob.sum(dim=-1)).cpu().tolist()  # (bsz, )
             # prob_lst.append(prob)
             # entropy_lst.append(entropy)
@@ -764,7 +880,6 @@ class RayPPOTrainer:
             # evaluate using reward_function
             
             reward_tensor = result["reward_tensor"]
-            
 
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -775,6 +890,40 @@ class RayPPOTrainer:
                     reward_extra_infos_dict[key].extend(lst)
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+            index = test_batch.non_tensor_batch["index"]
+            data_source = test_batch.non_tensor_batch["data_source"]
+
+            for i, idx in enumerate(index):
+                sample_datasource = data_source[i]
+                sample_source_idx = f"{sample_datasource}_{idx}"
+                sample_id2accuracy[sample_source_idx].append(scores[i])
+                if scores[i] == 1:
+                    sample_id2pos_entropy[sample_source_idx].append(entropy[i].item())
+                    sample_id2pos_response_length[sample_source_idx].append(response_length[i].item())
+                else:
+                    sample_id2neg_entropy[sample_source_idx].append(entropy[i].item())
+                    sample_id2neg_response_length[sample_source_idx].append(response_length[i].item())
+                sample_id2entropy[sample_source_idx].append(entropy[i].item())
+                sample_id2response_length[sample_source_idx].append(response_length[i].item())
+            
+            # for sample_source_idx in sample_id2accuracy:
+            #     mean_accuracy = sum(sample_id2accuracy[sample_source_idx]) / len(sample_id2accuracy[sample_source_idx]) if len(sample_id2accuracy[sample_source_idx]) > 0 else 0
+            #     pos_mean_entropy = sum(sample_id2pos_entropy[sample_source_idx]) / len(sample_id2pos_entropy[sample_source_idx]) if len(sample_id2pos_entropy[sample_source_idx]) > 0 else 0
+            #     neg_mean_entropy = sum(sample_id2neg_entropy[sample_source_idx]) / len(sample_id2neg_entropy[sample_source_idx]) if len(sample_id2neg_entropy[sample_source_idx]) > 0 else 0
+            #     mean_entropy = sum(sample_id2entropy[sample_source_idx]) / len(sample_id2entropy[sample_source_idx]) if len(sample_id2entropy[sample_source_idx]) > 0 else 0
+            #     pos_mean_length = sum(sample_id2pos_response_length[sample_source_idx]) / len(sample_id2pos_response_length[sample_source_idx]) if len(sample_id2pos_response_length[sample_source_idx]) > 0 else 0
+            #     neg_mean_length = sum(sample_id2neg_response_length[sample_source_idx]) / len(sample_id2neg_response_length[sample_source_idx]) if len(sample_id2neg_response_length[sample_source_idx]) > 0 else 0
+            #     mean_length = sum(sample_id2response_length[sample_source_idx]) / len(sample_id2response_length[sample_source_idx]) if len(sample_id2response_length[sample_source_idx]) > 0 else 0
+
+            #     self.val_idx2metrics['acc'][sample_source_idx].append(mean_accuracy)
+            #     self.val_idx2metrics['entropy']['pos'][sample_source_idx].append(pos_mean_entropy)
+            #     self.val_idx2metrics['entropy']['neg'][sample_source_idx].append(neg_mean_entropy)
+            #     self.val_idx2metrics['entropy']['mean'][sample_source_idx].append(mean_entropy)
+            #     self.val_idx2metrics['length']['pos'][sample_source_idx].append(pos_mean_length)
+            #     self.val_idx2metrics['length']['neg'][sample_source_idx].append(neg_mean_length)
+            #     self.val_idx2metrics['length']['mean'][sample_source_idx].append(mean_length)
+            # breakpoint()
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -794,6 +943,9 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
+        # TODO: val-core 加上 avg entropy 和 response length
+        # TODO: save self.val_idx2metrics results
+
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -807,6 +959,50 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        entropy_list = defaultdict(list)
+        response_length_list = defaultdict(list)
+
+        for sample_source_idx in sample_id2accuracy:
+            data_source = sample_source_idx.split('_')[0]
+            mean_accuracy = sum(sample_id2accuracy[sample_source_idx]) / len(sample_id2accuracy[sample_source_idx]) if len(sample_id2accuracy[sample_source_idx]) > 0 else 0
+            pos_mean_entropy = sum(sample_id2pos_entropy[sample_source_idx]) / len(sample_id2pos_entropy[sample_source_idx]) if len(sample_id2pos_entropy[sample_source_idx]) > 0 else 0
+            neg_mean_entropy = sum(sample_id2neg_entropy[sample_source_idx]) / len(sample_id2neg_entropy[sample_source_idx]) if len(sample_id2neg_entropy[sample_source_idx]) > 0 else 0
+            mean_entropy = sum(sample_id2entropy[sample_source_idx]) / len(sample_id2entropy[sample_source_idx]) if len(sample_id2entropy[sample_source_idx]) > 0 else 0
+            pos_mean_length = sum(sample_id2pos_response_length[sample_source_idx]) / len(sample_id2pos_response_length[sample_source_idx]) if len(sample_id2pos_response_length[sample_source_idx]) > 0 else 0
+            neg_mean_length = sum(sample_id2neg_response_length[sample_source_idx]) / len(sample_id2neg_response_length[sample_source_idx]) if len(sample_id2neg_response_length[sample_source_idx]) > 0 else 0
+            mean_length = sum(sample_id2response_length[sample_source_idx]) / len(sample_id2response_length[sample_source_idx]) if len(sample_id2response_length[sample_source_idx]) > 0 else 0
+
+            self.val_idx2metrics['acc'][sample_source_idx].append(mean_accuracy)
+            self.val_idx2metrics['entropy']['pos'][sample_source_idx].append(pos_mean_entropy)
+            self.val_idx2metrics['entropy']['neg'][sample_source_idx].append(neg_mean_entropy)
+            self.val_idx2metrics['entropy']['mean'][sample_source_idx].append(mean_entropy)
+            self.val_idx2metrics['length']['pos'][sample_source_idx].append(pos_mean_length)
+            self.val_idx2metrics['length']['neg'][sample_source_idx].append(neg_mean_length)
+            self.val_idx2metrics['length']['mean'][sample_source_idx].append(mean_length)
+
+            entropy_list[data_source].append(mean_entropy)
+            response_length_list[data_source].append(mean_length)
+            
+            # detailed_sec = f"val_detailed_{sample_source_idx}"
+            # metric_dict[f"{detailed_sec}/mean_accuracy"] = mean_accuracy
+            # metric_dict[f"{detailed_sec}/pos_mean_entropy"] = pos_mean_entropy
+            # metric_dict[f"{detailed_sec}/neg_mean_entropy"] = neg_mean_entropy
+            # metric_dict[f"{detailed_sec}/mean_entropy"] = mean_entropy
+            # metric_dict[f"{detailed_sec}/pos_mean_length"] = pos_mean_length
+            # metric_dict[f"{detailed_sec}/neg_mean_length"] = neg_mean_length
+            # metric_dict[f"{detailed_sec}/mean_length"] = mean_length
+
+        for data_source in entropy_list:
+            all_samples_entropy = sum(entropy_list[data_source]) / len(entropy_list[data_source])
+            metric_dict[f"val-core/{data_source}/entropy"] = all_samples_entropy
+            all_samples_length = sum(response_length_list[data_source]) / len(response_length_list[data_source])
+            metric_dict[f"val-core/{data_source}/response_length"] = all_samples_length
+
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        self._dump_val_idx2metrics(dump_dir=rollout_data_dir)
+
+        # breakpoint()
 
         return metric_dict
 
@@ -1012,6 +1208,22 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
+        # val_id2metric
+
+        self.val_idx2metrics = {
+            'acc': defaultdict(list),
+            'length': {
+                'pos': defaultdict(list),
+                'neg': defaultdict(list),
+                'mean': defaultdict(list),
+            },
+            'entropy': {
+                'pos': defaultdict(list),
+                'neg': defaultdict(list),
+                'mean': defaultdict(list),
+            }
+        }
+
         # load checkpoint before doing anything
         self._load_checkpoint()
 
@@ -1037,6 +1249,37 @@ class RayPPOTrainer:
         last_val_metrics = None
 
         advantage = self.config.algorithm.advantage
+
+        
+
+        # id2metric
+
+        self.idx2metrics = {
+            'acc': defaultdict(list),
+            'length': {
+                'pos': defaultdict(list),
+                'neg': defaultdict(list),
+                'mean': defaultdict(list),
+            },
+            'entropy': {
+                'pos': defaultdict(list),
+                'neg': defaultdict(list),
+                'mean': defaultdict(list),
+            }
+        }
+
+        self.accuracy_group2metrics = {
+            'entropy': {'mean': {}, 'pos': {}, 'neg': {}},
+            'length':  {'mean': {}, 'pos': {}, 'neg': {}},
+        }
+
+        for i in range(self.config.actor_rollout_ref.rollout.n + 1):
+            self.accuracy_group2metrics['entropy']['mean'][i]  = defaultdict(list)
+            self.accuracy_group2metrics['entropy']['pos'][i]    = defaultdict(list)
+            self.accuracy_group2metrics['entropy']['neg'][i]    = defaultdict(list)
+            self.accuracy_group2metrics['length']['mean'][i]   = defaultdict(list)
+            self.accuracy_group2metrics['length']['pos'][i]     = defaultdict(list)
+            self.accuracy_group2metrics['length']['neg'][i]     = defaultdict(list)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1119,7 +1362,7 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
+                        entropys = old_log_prob.batch["entropys"] # entropy
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
@@ -1131,7 +1374,7 @@ class RayPPOTrainer:
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
-                            actor_old_log_probs = batch.batch["old_log_probs"]
+                            actor_old_log_probs = batch.batch["old_log_probs"] # old_log_probs
                             attention_mask = batch.batch["attention_mask"]
                             responses = batch.batch["responses"]
                             response_length = responses.size(1)
@@ -1203,31 +1446,114 @@ class RayPPOTrainer:
 
                         # Step 1: Compute correctness per UID
                         id2correct = defaultdict(lambda: [0, 0])  # [correct_count, total_count]
+                        id2correct_length = defaultdict(list)
+                        id2incorrect_length = defaultdict(list)
+                        id2correct_entropy = defaultdict(list)
+                        id2incorrect_entropy = defaultdict(list)
+                        group2sample_id = {
+                            'num': defaultdict(int),
+                            'length': {
+                                'pos': defaultdict(list),
+                                'neg': defaultdict(list),
+                                'mean': defaultdict(list),
+                            },
+                            'entropy': {
+                                'pos': defaultdict(list),
+                                'neg': defaultdict(list),
+                                'mean': defaultdict(list),
+                            }
+                        }
 
                         bsz = batch.batch.batch_size[0]
                         for i in range(bsz):
-                            uid = batch.non_tensor_batch['uid'][i]
-                            id2correct[uid][1] += 1  # Total count
+                            idx = batch.non_tensor_batch['index'][i]
+
+                            response_length = batch.batch["responses"][i].shape[-1]
+                            response_mask = batch.batch["attention_mask"][i][-response_length:]
+                            response_length = response_mask.sum().float().item()
+
+                            entropy = entropys[i, :]
+                            mean_entropy = entropy[entropy.nonzero()].mean().item()
+
+                            id2correct[idx][1] += 1  # Total count
                             if correct_idx[i]:  # keep_mask[i] = True means correct, so False means incorrect
-                                id2correct[uid][0] += 1  # Correct count
+                                id2correct[idx][0] += 1  # Correct count
+                                id2correct_length[idx].append(response_length)
+                                id2correct_entropy[idx].append(mean_entropy)
+                            else:
+                                id2incorrect_length[idx].append(response_length)
+                                id2incorrect_entropy[idx].append(mean_entropy)
+                            
+                        idx_set = set(batch.non_tensor_batch['index'].tolist())
+                        for idx in idx_set:
+                            if idx not in id2correct_length:
+                                id2correct_length[idx] = []
+                            if idx not in id2incorrect_length:
+                                id2incorrect_length[idx] = []
+                            if idx not in id2correct_entropy:
+                                id2correct_entropy[idx] = []
+                            if idx not in id2incorrect_entropy:
+                                id2incorrect_entropy[idx] = []
 
                         # Step 2: Compute correctness percentage
-                        id2correctness = {uid: correct / total for uid, (correct, total) in id2correct.items()}
-                        fully_solved_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness == 1.0])
-                        fully_unsolved_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness == 0.0])
-                        at_least_solve_one_time_question_cnt += len([uid for uid, correctness in id2correctness.items() if correctness > 0.0])
+                        id2correctness = {idx: correct / total for idx, (correct, total) in id2correct.items()}
+                        for idx in id2correct_length:
+                            correct_num = id2correct[idx][0]
+                            accuracy = id2correctness[idx]
+                            correct_length = id2correct_length[idx]
+                            incorrect_length = id2incorrect_length[idx]
+                            correct_entropy = id2correct_entropy[idx]
+                            incorrect_entropy = id2incorrect_entropy[idx]
 
-                        # Step 3: Filter out UIDs exceeding the threshold
-                        fully_solved_uids = {uid for uid, correctness in id2correctness.items() if correctness >= 1}
-                        fully_unsolved_uids = {uid for uid, correctness in id2correctness.items() if correctness <= 0}
-                        one_time_solved_uids = {uid for uid, correctness in id2correctness.items() if 0 < correctness <= 1}
-                        tqdm.write(f"{len(fully_solved_uids)} out of {len(id2correctness)} UIDs in current batch are fully correct!")
-                        tqdm.write(f"{len(fully_unsolved_uids)} out of {len(id2correctness)} UIDs in current batch are fully incorrect!")
-                        tqdm.write(f"{len(one_time_solved_uids)} out of {len(id2correctness)} UIDs in current batch are at least solved one time!")
+                            self.idx2metrics['acc'][idx].append(accuracy)
+                            self.idx2metrics['length']['pos'][idx].append(sum(correct_length) / len(correct_length) if len(correct_length) > 0 else 0)
+                            self.idx2metrics['length']['neg'][idx].append(sum(incorrect_length) / len(incorrect_length) if len(incorrect_length) > 0 else 0)
+                            self.idx2metrics['length']['mean'][idx].append((sum(correct_length) + sum(incorrect_length)) / (len(correct_length) + len(incorrect_length)))
+                            self.idx2metrics['entropy']['pos'][idx].append(sum(correct_entropy) / len(correct_entropy) if len(correct_entropy) > 0 else 0)
+                            self.idx2metrics['entropy']['neg'][idx].append(sum(incorrect_entropy) / len(incorrect_entropy) if len(incorrect_entropy) > 0 else 0)
+                            self.idx2metrics['entropy']['mean'][idx].append((sum(correct_entropy) + sum(incorrect_entropy)) / (len(correct_entropy) + len(incorrect_entropy)))
+
+                            group2sample_id['num'][correct_num] += 1
+                            group2sample_id['length']['pos'][correct_num].append(self.idx2metrics['length']['pos'][idx][-1])
+                            group2sample_id['length']['neg'][correct_num].append(self.idx2metrics['length']['neg'][idx][-1])
+                            group2sample_id['length']['mean'][correct_num].append(self.idx2metrics['length']['mean'][idx][-1])
+                            group2sample_id['entropy']['pos'][correct_num].append(self.idx2metrics['entropy']['pos'][idx][-1])
+                            group2sample_id['entropy']['neg'][correct_num].append(self.idx2metrics['entropy']['neg'][idx][-1])
+                            group2sample_id['entropy']['mean'][correct_num].append(self.idx2metrics['entropy']['mean'][idx][-1])
+
+                        for i in range(self.config.actor_rollout_ref.rollout.n + 1):
+                            metrics.update(
+                                {
+                                    f"{i}@{self.config.actor_rollout_ref.rollout.n}/number": group2sample_id['num'][i],
+                                }
+                            )
+                            for metric_name in ['length', 'entropy']:
+                                for stat in ['pos', 'neg', 'mean']:
+                                    values = group2sample_id[metric_name][stat][i]
+                                    avg = sum(values) / len(values) if len(values) > 0 else 0
+                                    self.accuracy_group2metrics[metric_name][stat][i] = avg
+                                    metrics.update(
+                                        {
+                                            f"{i}@{self.config.actor_rollout_ref.rollout.n}/{metric_name}/{stat}": avg,
+                                        }
+                                    )
+
+                        fully_solved_question_cnt += len([idx for idx, correctness in id2correctness.items() if correctness == 1.0])
+                        fully_unsolved_question_cnt += len([idx for idx, correctness in id2correctness.items() if correctness == 0.0])
+                        at_least_solve_one_time_question_cnt += len([idx for idx, correctness in id2correctness.items() if correctness > 0.0])
+
+                        # Step 3: Filter out idx exceeding the threshold
+                        fully_solved_idxs = {idx for idx, correctness in id2correctness.items() if correctness >= 1}
+                        fully_unsolved_idxs = {idx for idx, correctness in id2correctness.items() if correctness <= 0}
+                        one_time_solved_idxs = {idx for idx, correctness in id2correctness.items() if 0 < correctness <= 1}
+                        tqdm.write(f"{len(fully_solved_idxs)} out of {len(id2correctness)} idxs in current batch are fully correct!")
+                        tqdm.write(f"{len(fully_unsolved_idxs)} out of {len(id2correctness)} idxs in current batch are fully incorrect!")
+                        tqdm.write(f"{len(one_time_solved_idxs)} out of {len(id2correctness)} idxs in current batch are at least solved one time!")
 
                         raw_batch = deepcopy(batch)
 
-                        raw_batch = compute_advantage(raw_batch,
+                        raw_batch = compute_advantage(
+                            raw_batch,
                             adv_estimator=AdvantageEstimator.GRPO,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
@@ -1259,20 +1585,34 @@ class RayPPOTrainer:
                             continue
 
                         metrics["effective_examples"] = batch.batch.batch_size[0]
-                        metrics["correct_count"] = correct_count
-                        metrics["incorrect_count"] = incorrect_count
+                        metrics["correct_count"] = correct_count.item()
+                        metrics["incorrect_count"] = incorrect_count.item()
                         # compute advantages, executed on the driver process
+
+                        # breakpoint()
+
                         batch = compute_advantage(batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             advantage=advantage,
+                            entropys=entropys,
                             positive_advantage_weight=self.config.algorithm.positive_advantage_weight,
+                            negative_advantage_weight=self.config.algorithm.negative_advantage_weight,
+                            token_weighted_metric=self.config.algorithm.token_weighted_metric, # probs / entropy
+                            token_weighted_positive_high_num_ratio=self.config.algorithm.token_weighted_positive_high_num_ratio, # positive high num ratio
+                            token_weighted_positive_high_scale=self.config.algorithm.token_weighted_positive_high_scale, # positive high scale
+                            token_weighted_positive_low_num_ratio=self.config.algorithm.token_weighted_positive_low_num_ratio, # positive low num ratio
+                            token_weighted_positive_low_scale=self.config.algorithm.token_weighted_positive_low_scale, # positive low scale
+                            token_weighted_negative_high_num_ratio=self.config.algorithm.token_weighted_negative_high_num_ratio, # negative high num ratio
+                            token_weighted_negative_high_scale=self.config.algorithm.token_weighted_negative_high_scale, # negative high scale
+                            token_weighted_negative_low_num_ratio=self.config.algorithm.token_weighted_negative_low_num_ratio, # negative low num ratio
+                            token_weighted_negative_low_scale=self.config.algorithm.token_weighted_negative_low_scale, # negative low scale
                         )
 
                     # TODO: use raw batch advantage
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR:
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.PSR_NSR and advantage != 'weighted' and advantage != "token-weighted":
                         batch.batch['advantages'] = raw_batch.batch['advantages']
 
                     # update critic
@@ -1296,7 +1636,6 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1315,6 +1654,8 @@ class RayPPOTrainer:
                             if is_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
+
+                        self._dump_idx2metrics(dump_dir=rollout_data_dir)
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):

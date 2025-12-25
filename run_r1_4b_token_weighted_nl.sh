@@ -8,10 +8,11 @@ export TENSORBOARD_DIR=/home/admin/logs/tfevent
 
 export PATH_TO_VERL="/ossfs/workspace/psr_nsr_0922"  # Path to verl repository
 export PRETRAIN_MODEL="/ossfs/workspace/Qwen3-4b-base"  # Pretrain model used for actor/ref/critic
-export TRAIN_DATA="/ossfs/workspace/data/math_rl/dapo-math-17k.parquet"
-export EVAL_DATA="/ossfs/workspace/data/eval_rl/aime_2024_problems.parquet"
+export TRAIN_DATA="/ossfs/workspace/psr_nsr_data/train_data/dapo-math-17k-1.parquet"
+export EVAL_DATA="/ossfs/workspace/psr_nsr_data/eval_data/aime-2024.parquet"
 export SAVE_ROOT_PATH="/ossfs/workspace/math_save_model"
 export ROLLOUT_DATA_PATH="/ossfs/workspace/math_save_rollout"
+export VALIDATE_DATA_PATH="/ossfs/workspace/math_save_val"
 
 # export advantage="positive"   # PSR
 # export advantage="negative"   # NSR
@@ -19,6 +20,21 @@ export ROLLOUT_DATA_PATH="/ossfs/workspace/math_save_rollout"
 # export positive_advantage_weight=0.1   # For W-REINFORCE only
 
 export RAY_DEBUG_POST_MORTEM=1
+
+# export advantage="weighted"
+# export positive_advantage_weight=2
+# export negative_advantage_weight=1
+export advantage="token-weighted"
+export token_weighted_metric="prob" # prob / entropy
+# export token_weighted_positive_high_num_ratio=0.2 # positive high num ratio
+# export token_weighted_positive_high_scale=0.5 # positive high scale
+# export token_weighted_positive_low_num_ratio=0.2 # positive low num ratio
+# export token_weighted_positive_low_scale=2 # positive low scale
+# export token_weighted_negative_high_num_ratio=0.2 # negative high num ratio
+# export token_weighted_negative_high_scale=2 # negative high scale
+export token_weighted_negative_low_num_ratio=0.2 # negative low num ratio
+export token_weighted_negative_low_scale=2 # negative low scale
+
 
 cd $PATH_TO_VERL
 
@@ -31,8 +47,11 @@ python3 -m verl.trainer.main_ppo \
       data.max_response_length=8192 \
       data.train_batch_size=32 \
       data.filter_overlong_prompts=True \
-      algorithm.adv_estimator=psr_nsr \
+      algorithm.adv_estimator=grpo \
       algorithm.advantage=${advantage} \
+      algorithm.token_weighted_metric=${token_weighted_metric} \
+      algorithm.token_weighted_negative_low_num_ratio=${token_weighted_negative_low_num_ratio} \
+      algorithm.token_weighted_negative_low_scale=${token_weighted_negative_low_scale} \
       algorithm.use_kl_in_reward=False \
       algorithm.kl_ctrl.kl_coef=0.0 \
       actor_rollout_ref.model.path=${PRETRAIN_MODEL} \
@@ -70,11 +89,13 @@ python3 -m verl.trainer.main_ppo \
       actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
       actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
       trainer.logger=['console'] \
-      trainer.val_before_train=False \
+      trainer.val_before_train=True \
       trainer.n_gpus_per_node=4 \
       trainer.nnodes=1 \
       trainer.save_freq=-1 \
       trainer.test_freq=10 \
       trainer.total_epochs=15 \
-      > train_output_nsr.log 2>&1 &
+      trainer.rollout_data_dir=${ROLLOUT_DATA_PATH} \
+      trainer.validation_data_dir=${VALIDATE_DATA_PATH}
+      # \ > train_output_nsr.log 2>&1 &
       # algorithm.positive_advantage_weight=$positive_advantage_weight \

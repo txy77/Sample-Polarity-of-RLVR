@@ -181,6 +181,8 @@ actor_rollout_ref:
     entropy_coeff: 0
 
     positive_learning_weight: null
+
+    negative_learning_weight: null
     
     # Whether to use KL loss instead of KL reward penalty. True for GRPO
     use_kl_loss: false
@@ -439,10 +441,10 @@ actor_rollout_ref:
       temperature: 0
 
       # whether to repeat n times for validation
-      n: 1
+      n: 4
 
       # Whether to sample during training rollout. False uses greedy sampling.
-      do_sample: False
+      do_sample: True
 
     # Multi-turn interaction config for tools or chat.
     multi_turn:
@@ -738,6 +740,26 @@ algorithm:
   advantage: positive
 
   positive_advantage_weight: 1
+
+  negative_advantage_weight: 1
+
+  token_weighted_metric: null # prob / entropy
+
+  token_weighted_positive_high_num_ratio: null # positive high num ratio
+
+  token_weighted_positive_high_scale: null # positive high scale
+
+  token_weighted_positive_low_num_ratio: null # positive low num ratio
+
+  token_weighted_positive_low_scale: null # positive low scale
+
+  token_weighted_negative_high_num_ratio: null # negative high num ratio
+
+  token_weighted_negative_high_scale: null # negative high scale
+
+  token_weighted_negative_low_num_ratio: null # negative low num ratio
+
+  token_weighted_negative_low_scale: null # negative low scale
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True

@@ -8,43 +8,42 @@ export TENSORBOARD_DIR=/home/admin/logs/tfevent
 
 export PATH_TO_VERL="/ossfs/workspace/psr_nsr_0922"  # Path to verl repository
 export PRETRAIN_MODEL="/ossfs/workspace/Qwen3-4b-base"  # Pretrain model used for actor/ref/critic
-export TRAIN_DATA="/ossfs/workspace/data/math_rl/dapo-math-17k.parquet"
-export EVAL_DATA="/ossfs/workspace/data/eval_rl/aime_2024_problems.parquet"
+export TRAIN_DATA="/ossfs/workspace/psr_nsr_data/train_data/dapo-math-17k-1.parquet"
 export SAVE_ROOT_PATH="/ossfs/workspace/math_save_model"
 export ROLLOUT_DATA_PATH="/ossfs/workspace/math_save_rollout"
+export VAL_DATA_PATH="/ossfs/workspace/math_save_val"
 
-# export advantage="positive"   # PSR
-# export advantage="negative"   # NSR
-# export advantage="weighted"   # W-REINFORCE
-# export positive_advantage_weight=0.1   # For W-REINFORCE only
+AIME24=/ossfs/workspace/psr_nsr_data/eval_data/aime-2024.parquet
+AIME25=/ossfs/workspace/psr_nsr_data/eval_data/aime-2025.parquet
+# EVAL_DATA=("$AIME24" "$AIME25")
+# export EVAL_DATA = AIME24
+EVAL_DATA="['$AIME24', '$AIME25']"
 
-export RAY_DEBUG_POST_MORTEM=1
 
 cd $PATH_TO_VERL
 
 python3 -m verl.trainer.main_ppo \
       data.train_files=${TRAIN_DATA} \
-      data.val_files=${EVAL_DATA} \
+      data.val_files="$EVAL_DATA" \
       data.prompt_key=prompt \
       data.truncation=left \
       data.max_prompt_length=1024 \
       data.max_response_length=8192 \
       data.train_batch_size=32 \
       data.filter_overlong_prompts=True \
-      algorithm.adv_estimator=psr_nsr \
-      algorithm.advantage=${advantage} \
+      algorithm.adv_estimator=grpo \
       algorithm.use_kl_in_reward=False \
       algorithm.kl_ctrl.kl_coef=0.0 \
       actor_rollout_ref.model.path=${PRETRAIN_MODEL} \
       actor_rollout_ref.model.use_remove_padding=True \
       actor_rollout_ref.model.enable_gradient_checkpointing=True \
       actor_rollout_ref.model.trust_remote_code=True \
-      actor_rollout_ref.actor.optim.lr=5e-5 \
-      actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+      actor_rollout_ref.actor.optim.lr=1e-6 \
+      actor_rollout_ref.actor.optim.lr_warmup_steps=-1 \
       actor_rollout_ref.actor.ppo_mini_batch_size=8 \
-      actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-      actor_rollout_ref.actor.use_kl_loss=False \
-      actor_rollout_ref.actor.kl_loss_coef=0.0 \
+      actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+      actor_rollout_ref.actor.use_kl_loss=True \
+      actor_rollout_ref.actor.kl_loss_coef=0.001 \
       actor_rollout_ref.actor.kl_loss_type=low_var_kl \
       actor_rollout_ref.actor.entropy_coeff=0 \
       actor_rollout_ref.actor.fsdp_config.param_offload=True \
@@ -55,26 +54,27 @@ python3 -m verl.trainer.main_ppo \
       actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
       actor_rollout_ref.ref.fsdp_config.param_offload=True \
       actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-      actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+      actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
       actor_rollout_ref.rollout.name=vllm \
       actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
       actor_rollout_ref.rollout.n=8 \
       actor_rollout_ref.rollout.enable_chunked_prefill=True \
-      actor_rollout_ref.rollout.max_num_batched_tokens=9216 \
+      actor_rollout_ref.rollout.max_num_batched_tokens=10000 \
       actor_rollout_ref.rollout.enforce_eager=False \
       actor_rollout_ref.rollout.free_cache_engine=False \
       actor_rollout_ref.rollout.temperature=1.0 \
       actor_rollout_ref.rollout.top_p=1.0 \
       actor_rollout_ref.rollout.top_k=-1 \
-      actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
-      actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+      actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+      actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
       actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
-      trainer.logger=['console'] \
-      trainer.val_before_train=False \
-      trainer.n_gpus_per_node=4 \
+      actor_rollout_ref.rollout.val_kwargs.n=8 \
+      trainer.logger=['tensorboard'] \
+      trainer.val_before_train=True \
+      trainer.n_gpus_per_node=1 \
       trainer.nnodes=1 \
       trainer.save_freq=-1 \
-      trainer.test_freq=10 \
-      trainer.total_epochs=15 \
-      > train_output_nsr.log 2>&1 &
-      # algorithm.positive_advantage_weight=$positive_advantage_weight \
+      trainer.test_freq=2 \
+      trainer.total_epochs=5 \
+      trainer.rollout_data_dir=${ROLLOUT_DATA_PATH} \
+      trainer.validation_data_dir=${VAL_DATA_PATH}
