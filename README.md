@@ -117,15 +117,28 @@ If you find this work helpful, please cite:
 ```bibtex
 @inproceedings{tang-etal-2026-rethinking,
     title = "Rethinking Sample Polarity in Reinforcement Learning with Verifiable Rewards",
-    author = "Tang, Xinyu and Zhan, Yuliang and Li, Zhixun and Zhao, Xin and
-              Zhang, Zhenduo and Wen, Zujie and Zhang, Zhiqiang and Zhou, Jun",
-    booktitle = "Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)",
+    author = "Tang, Xinyu  and
+      Zhan, Yuliang  and
+      Li, Zhixun  and
+      Zhao, Xin  and
+      Zhang, Zhenduo  and
+      Wen, Zujie  and
+      Zhang, Zhiqiang  and
+      Zhou, Jun",
+    editor = "Liakata, Maria  and
+      Moreira, Viviane P.  and
+      Zhang, Jiajun  and
+      Jurgens, David",
+    booktitle = "Proceedings of the 64th Annual Meeting of the {A}ssociation for {C}omputational {L}inguistics (Volume 1: Long Papers)",
+    month = jul,
     year = "2026",
     address = "San Diego, California, United States",
     publisher = "Association for Computational Linguistics",
     url = "https://aclanthology.org/2026.acl-long.134/",
     doi = "10.18653/v1/2026.acl-long.134",
-    pages = "2928--2954"
+    pages = "2928--2954",
+    ISBN = "979-8-89176-390-6",
+    abstract = "Large reasoning models (LRMs) are typically trained using reinforcement learning with verifiable reward (RLVR) to enhance their reasoning abilities. In this paradigm, policies are updated using both positive and negative self-generated rollouts, which correspond to distinct ***sample polarities***. In this paper, we provide a systematic investigation into how these sample polarities affect RLVR training dynamics and behaviors. We find that positive samples sharpen existing correct reasoning patterns, while negative samples encourage exploration of new reasoning paths. We further explore how adjusting the advantage values of positive and negative samples at both the polarity level and the token level affects RLVR training. Based on these insights, we propose an **A**daptive and **A**symmetric token-level **A**dvantage shaping method for **P**olicy **O**ptimization, namely **A3PO**, that more precisely allocates advantage signals to key tokens across different polarities. Experiments across five reasoning benchmarks demonstrate the effectiveness of our approach."
 }
 ```
 
